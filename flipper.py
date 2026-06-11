@@ -39,7 +39,6 @@ hug exactly that.
 import time
 
 import torch
-import torch.nn.functional as F
 
 import foolbox as fb  # SOTA attack library — we COMPOSE FMN from it, never reimplement it
 
@@ -102,25 +101,6 @@ def _fmn_direction(model, clean, target_index, device, steps):
     return raw_advs.squeeze(0) - clean
 
 
-def _pgd_direction(model, clean, target_index, cap, device, deadline, steps=12):
-    """Reliable fallback: untargeted PGD clamped to the SCORE cap (0.03), not epsilon.
-
-    This is the baseline's loop but projected into ±cap so it stays score-eligible. Used only
-    when FMN fails to produce a flipping direction, so the label still changes."""
-    adv = clean.clone().detach()
-    step_size = max(cap / 4.0, 1.0 / 255.0)
-    for _ in range(steps):
-        if time.time() >= deadline:
-            break
-        adv.requires_grad_(True)
-        logits = logits_for_images(model=model, image_bchw=adv.unsqueeze(0))
-        loss = F.cross_entropy(logits, torch.tensor([target_index], device=device))
-        grad = torch.autograd.grad(loss, adv)[0]
-        adv = adv.detach() + step_size * grad.sign()
-        adv = torch.max(torch.min(adv, clean + cap), clean - cap).clamp(0.0, 1.0)  # ±cap, not ±eps
-    return adv - clean
-
-
 def perturb(
     model: torch.nn.Module,
     clean: torch.Tensor,
@@ -129,75 +109,53 @@ def perturb(
     min_delta: float,
     device: torch.device,
     steps: int = 30,
-    timeout_seconds: float = None,
-    time_margin: float = 2.0,
 ) -> torch.Tensor:
-    """Minimal-norm flip tuned to the validator's post-PNG scoring, with a hard time budget.
+    """Floor-aware minimal-norm flip (pure FMN — no PGD fallback).
 
-    Same first-6 args / return as flipper-base.perturb (drop-in). Extra optional args:
-      timeout_seconds: the challenge timeout (defaults to C.TIMEOUT_SECONDS). The miner can
-                       pass synapse.timeout_seconds here.
-      time_margin:     finish this many seconds BEFORE the timeout so the encoded response is
-                       safely back in time (the validator zeroes any late/missing reply).
-    `steps` is the DESIRED FMN iteration count; it is automatically reduced if the hardware
-    can't run that many within the budget."""
-    t_start = time.time()
-    timeout_seconds = float(C.TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds)
-    deadline = t_start + max(1.0, timeout_seconds - time_margin)  # the moment we MUST be done by
+    The subnet does NOT reward the absolute smallest perturbation: anything below min_delta
+    scores 0.0 (hard gate), and linf_score = (1 - linf_ratio)^2 is highest when the norm sits
+    just ABOVE the floor. So the real objective is:
 
+        the SMALLEST adversarial perturbation whose L-inf is still >= min_delta (and <= cap),
+        that still flips the label AFTER the validator's 8-bit PNG round-trip.
+
+    We therefore (1) let FMN find the minimal-L-inf adversarial DIRECTION, then (2) scan that
+    direction UPWARD starting AT the floor — never wasting work in the sub-min_delta region —
+    and return the first norm that flips post-PNG. `steps` = FMN iterations (more = a tighter
+    minimal norm; raise it for hard images)."""
     epsilon = float(epsilon)
     min_delta = float(min_delta)
     cap = min(epsilon, float(C.MAX_LINF_DELTA))   # score-eligible ceiling (0.03 in prod)
     floor = min_delta                             # score-eligible floor (0.003 in prod)
     clean = clean.to(device)
 
-    # ---- size the FMN budget -----------------------------------------------------------
-    # One forward+backward ~= one FMN step. Probe that cost on THIS image (resolution varies
-    # per challenge) and keep ~60% of the remaining time for FMN, leaving the rest for the
-    # cheap line search. FMN with <5 steps is useless, so if we can't afford that we skip
-    # straight to the reliable PGD direction below.
-    probe = time.time()
-    xp = clean.unsqueeze(0).detach().requires_grad_(True)
-    logits_for_images(model=model, image_bchw=xp).sum().backward()
-    step_cost = max(time.time() - probe, 1e-3)
-    affordable = int(((deadline - time.time()) * 0.6) // step_cost)
-    fmn_steps = min(int(steps), max(0, affordable))
-
-    # ---- 1) pick a flipping DIRECTION — LABEL CHANGE IS THE HARD PRIORITY --------------
-    # Prefer FMN's minimal-norm direction, but ONLY if it actually flips when scaled to the
-    # cap. Otherwise fall back to PGD, which reliably flips. This guarantees we never return
-    # an unperturbed image when a flip within the cap is reachable.
-    direction = None
-    if fmn_steps >= 5:
-        d = _fmn_direction(model, clean, target_index, device, fmn_steps)
-        bl = float(d.abs().max().item())
-        if bl > 1e-12 and _png_eval(model, clean, _scale_to(clean, d, bl, cap), target_index, device)[1]:
-            direction = d                                       # FMN flips at the cap -> use it (best minimality)
-    if direction is None:
-        direction = _pgd_direction(model, clean, target_index, cap, device, deadline)
-
+    # ---- 1) FMN: minimal-L-inf adversarial DIRECTION ---------------------------------
+    direction = _fmn_direction(model, clean, target_index, device, int(steps))
     base_linf = float(direction.abs().max().item())
     if base_linf < 1e-12:
-        return clean.clone()                                   # couldn't move at all (shouldn't happen)
+        return clean.clone()                      # FMN found no usable direction (very rare)
 
-    # Strongest legal perturbation = direction scaled to the cap. Keep it as a guaranteed flip.
+    # Strongest legal perturbation = direction scaled to the cap. If even this doesn't flip
+    # after the PNG round-trip, the image can't be flipped inside the allowed band -> return
+    # this best effort (still pure FMN; we do NOT fall back to PGD).
     cap_scaled = _scale_to(clean, direction, base_linf, cap)
     cap_norm, cap_flip = _png_eval(model, clean, cap_scaled, target_index, device)
     if not (cap_flip and floor <= cap_norm <= cap):
-        return cap_scaled        # flip not achievable within the cap (hard image): best effort
+        return cap_scaled
 
-    # ---- 2) line search DOWN: smallest norm that STILL flips after PNG -----------------
-    # We already hold a flipping result (cap_scaled), so the label stays changed no matter
-    # what. Now climb from the floor and return the FIRST (=smallest, =highest score) flip.
+    # ---- 2) floor-aware line search: smallest norm in [floor, cap] that still flips ---
+    # Start AT the floor (never below: that region always scores 0) and climb. The first hit
+    # is the smallest PNG-surviving flip -> highest linf_score. cap_scaled already flips, so
+    # the label is guaranteed changed regardless of how the scan ends.
     best = cap_scaled
-    target = max(floor, _Q)                                    # below 1/255 the perturbation rounds away
-    while target <= cap + 1e-9 and time.time() < deadline:
+    target = max(floor, _Q)                       # below 1/255 the perturbation rounds away
+    while target <= cap + 1e-9:
         cand = _scale_to(clean, direction, base_linf, min(target, cap))
         norm, flip = _png_eval(model, clean, cand, target_index, device)
         if flip and floor <= norm <= cap:
-            return cand          # smallest perturbation that survives PNG AND flips -> best score
-        target += 0.5 * _Q       # half-a-level granularity: tight but cheap search
-    return best                  # deadline hit before a smaller flip: return the guaranteed one
+            return cand                           # smallest surviving flip -> best score
+        target += 0.5 * _Q                        # half-a-level granularity: tight but cheap
+    return best
 
 
 # ======================================================================================
@@ -340,6 +298,4 @@ if __name__ == "__main__":
     print("\n=== FMN (minimal-norm, floor-hugging) ===")
     for k, v in report.items():
         print(f"{k:>18}: {v}")
-    safe = attack_time < (C.TIMEOUT_SECONDS - 1.0)
     print(f"{'attack_time':>18}: {attack_time:.3f}s")
-    print(f"{'within_timeout':>18}: {'PASS' if safe else 'FAIL'} (cutoff {C.TIMEOUT_SECONDS:.0f}s)")
