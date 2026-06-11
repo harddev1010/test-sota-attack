@@ -1,9 +1,9 @@
-# Minimal dependency set. Install with:  pip install -r requirements.txt
+# Install with:  pip install -r requirements.txt
 # (CPU works; a CUDA GPU makes the attacks much faster but is not required.)
-torch              # the deep-learning engine (tensors + autograd that attacks rely on)
-torchvision        # gives us EfficientNetV2-L + its official ImageNet weights/preprocessing
-foolbox            # SOTA minimal-norm attacks (FMN, DDN) — composed, not reinvented
-torchattacks       # SOTA attacks (FAB, PGD, CW) with a one-line API
-pillow             # image loading / saving (PNG round-trip the validator also does)
-numpy              # array math for the scoring metrics
-scikit-image       # battle-tested SSIM and PSNR implementations for the score gates
+torch>=2.2.0         # deep-learning engine (tensors + autograd the attacks rely on)
+torchvision>=0.17.0  # EfficientNetV2-L + its official ImageNet weights/preprocessing
+foolbox>=3.3.0       # SOTA Fast Minimum-Norm (FMN) attack — composed, not reinvented
+pillow>=10.0.0       # image <-> PNG (the exact round-trip the validator does)
+numpy>=1.26.0        # array math for image decode/encode
+# NOTE: scikit-image is intentionally NOT used — we replicate the validator's OWN
+# avg-pool SSIM and PSNR (in flipper.py) so local scores match the subnet exactly.

@@ -1,200 +1,239 @@
 """
-flipper.py — COMPOSE state-of-the-art adversarial attacks (we never reinvent them).
+flipper.py  —  FMN-based perturbation engine for the Perturb subnet (netuid 26).
 
-Goal: take a clean image, nudge its pixels by a tiny amount, and make EfficientNetV2-L
-predict a DIFFERENT label (untargeted: any change counts).
+Drop-in replacement for the baseline PGD block in the real miner. Identical signature to
+flipper-base.perturb, so deploying to prod = delete the PGD loop in miner.forward and:
 
-We offer 5 SOTA attacks via two libraries:
-  fmn  (foolbox)      : minimal-norm L-infinity attack — finds the SMALLEST L-inf change that flips
-  ddn  (foolbox)      : minimal-norm L2 attack         — finds the SMALLEST L2 change that flips
-  fab  (torchattacks) : Fast Adaptive Boundary         — walks to the nearest decision boundary
-  pgd  (torchattacks) : Projected Gradient Descent     — strong fixed-budget L-inf baseline
-  cw   (torchattacks) : Carlini-Wagner                 — optimization attack, very low distortion
+    from flipper import perturb
+    adv = perturb(self.model, clean, target_index, epsilon, min_delta, self.device)
 
-"Minimal-norm" attacks (fmn/ddn/fab/cw) try to be as INVISIBLE as possible, which is
-exactly what the Perturb score rewards. PGD is included as a loud, reliable baseline.
+Everything `perturb()` needs is imported from perturbnet.* (the same package prod has),
+so the function copy-pastes with ZERO edits. The helpers below the engine
+(load_clean_image / score_like_validator / warmup) are LAB-ONLY conveniences.
+
+────────────────────────────────────────────────────────────────────────────────────
+WHAT WE OPTIMISE FOR (from the real validator.verify_and_score)
+────────────────────────────────────────────────────────────────────────────────────
+Measured in the DECODED native-resolution [0,1] image:
+    norm = max|adv-clean|,   rmse = sqrt(mean((adv-clean)^2))
+Score (SPEED_WEIGHT=0, PERTURBATION_WEIGHT=1):
+    perturbation_score = 0.7*(1-linf_ratio)^2 + 0.3*(1-rmse_ratio)^2
+    linf_ratio = (norm-0.003)/(0.03-0.003)        # min(eps,0.03) is always 0.03
+    rmse_ratio = rmse/0.03
+…but ONLY if every gate passes: label changed, 0.003<=norm<=0.03, ssim>=0.98, psnr>=38.
+Any failure -> 0.0. Speed is irrelevant to the score (only the 15s hard timeout matters).
+
+So the score is maximised by flipping with `norm` as small as possible (hug the 0.003
+floor) and tiny rmse. That is precisely what FMN (Fast Minimum-Norm) does — unlike PGD,
+which burns a fixed, oversized budget and overshoots the 0.03 cap.
+
+This engine:
+  1) runs FMN (composed from foolbox) to get the minimal-L-inf flip DIRECTION, then
+  2) does a PNG-AWARE line search along that direction for the SMALLEST perturbation that
+     STILL flips after the validator's 8-bit PNG round-trip and passes every gate.
+The validator scores a re-decoded PNG (pixels quantised to multiples of 1/255 ~ 0.00392),
+so the smallest survivable norm is 1/255 — conveniently just above the 0.003 floor. We
+hug exactly that.
 """
 
-import argparse
-import time
-from datetime import datetime  # for human-readable wall-clock timestamps in the logs
-
 import torch
-import numpy as np
-from PIL import Image
-import torchattacks
-import foolbox as fb
 
-import config
-from model import load_model, predict, predict_index
+import foolbox as fb  # SOTA attack library — we COMPOSE FMN from it, never reimplement it
 
+from perturbnet import constants as C
+from perturbnet.image_io import encode_image_b64, decode_image_b64
+from perturbnet.model import logits_for_images, predict_index
 
-def _stamp():
-    """Current wall-clock time as MM:SS.mmm (minute:second:millisecond) for logs."""
-    now = datetime.now()
-    # %M=minute, %S=second; the last 3 digits of %f (microseconds) give milliseconds.
-    return now.strftime("%M:%S") + f".{now.microsecond // 1000:03d}"
+# cuDNN autotuning: input H/W is constant within a run, so let cuDNN pick the fastest
+# conv kernels (first call a touch slower, every later call faster).
+torch.backends.cudnn.benchmark = True
+
+_Q = 1.0 / 255.0  # one 8-bit quantisation step; the finest perturbation a PNG can carry
 
 
-# ----------------------------------------------------------------------------------
-# Distortion measurements — in [0,1] PIXEL space, the same space the validator uses.
-# ----------------------------------------------------------------------------------
-def linf_norm(clean, adv):
-    """L-infinity = the single largest per-pixel change (worst-case visibility)."""
-    return (adv - clean).abs().max().item()
+class _PreprocessedModel(torch.nn.Module):
+    """Adapts the classifier so foolbox can feed it native-res [0,1] images.
+
+    foolbox wants a module mapping the ATTACK space -> logits. Our attack space is the
+    decoded native-resolution [0,1] image; logits_for_images() applies the exact
+    resize+crop+normalize the validator uses, then the network. Wrapping it here means
+    FMN's gradients flow back to native pixels — the very pixels the validator measures."""
+
+    def __init__(self, base: torch.nn.Module) -> None:
+        super().__init__()
+        self.base = base
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # x: (N,3,H,W) in [0,1]
+        return logits_for_images(model=self.base, image_bchw=x)
 
 
-def rmse(clean, adv):
-    """Root-mean-square error = the typical per-pixel change (overall noisiness)."""
-    return torch.sqrt(((adv - clean) ** 2).mean()).item()
+def _png_roundtrip(image_chw: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Return the image EXACTLY as the validator will see it: encode to PNG, decode back.
+    Bakes in 8-bit quantisation so any check here matches scoring reality."""
+    return decode_image_b64(encode_image_b64(image_chw)).to(device)
 
 
-# ----------------------------------------------------------------------------------
-# OPTIONAL helper (OFF by default).
-# Pure minimal-norm attacks aim for the SMALLEST possible change — which can land BELOW
-# the validator's MIN_LINF_DELTA floor and fail the gate ("too small to count").
-# This rescales the perturbation up so its L-inf sits just above that floor.
-# Enable it (run_attack(..., hug_floor_on=True)) ONLY if your score report says the
-# "L-inf >= min_delta" gate FAILED for being too small.
-# ----------------------------------------------------------------------------------
-def hug_floor(delta, min_linf_delta):
-    cur = delta.abs().max().item()              # current largest change
-    if cur < min_linf_delta and cur > 0:        # only act if we're under the floor
-        scale = (min_linf_delta * 1.05) / cur   # +5% so PNG rounding won't dip us back under
-        delta = delta * scale
-    return delta
+def perturb(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    target_index: int,
+    epsilon: float,
+    min_delta: float,
+    device: torch.device,
+    steps: int = 30,
+) -> torch.Tensor:
+    """Minimal-norm flip tuned to the validator's post-PNG scoring.
+
+    Same signature/return as flipper-base.perturb. `steps` = FMN iterations (20-40 plenty)."""
+    epsilon = float(epsilon)
+    min_delta = float(min_delta)
+    cap = min(epsilon, float(C.MAX_LINF_DELTA))   # score-eligible ceiling (0.03 in prod)
+    floor = min_delta                             # score-eligible floor (0.003 in prod)
+    clean = clean.to(device)
+
+    # ---- 1) FMN: minimal-L-inf adversarial DIRECTION ---------------------------------
+    fmodel = fb.PyTorchModel(_PreprocessedModel(model).to(device).eval(), bounds=(0.0, 1.0))
+    attack = fb.attacks.LInfFMNAttack(steps=steps)              # minimises the L-inf norm of the flip
+    labels = torch.tensor([int(target_index)], device=device)  # the class to move AWAY from
+    _, advs, _ = attack(fmodel, clean.unsqueeze(0), labels, epsilons=None)  # None -> minimal
+    delta = advs.squeeze(0) - clean                            # perturbation direction FMN found
+    base_linf = float(delta.abs().max().item())
+
+    if base_linf < 1e-12:                                       # FMN produced nothing usable
+        return clean.clone()                                   # validator will score 0.0
+
+    # ---- 2) PNG-aware line search: smallest survivable flip --------------------------
+    # Scale `delta` to target L-inf values from the floor up to the cap. For each, simulate
+    # the exact PNG round-trip and accept the FIRST (=smallest, =highest score) one that
+    # still flips and lands inside [floor, cap].
+    start = max(floor, _Q)                                      # below 1/255 it rounds away to nothing
+    best_fallback = (clean + delta * (cap / base_linf)).clamp(0.0, 1.0)  # strongest legal try
+
+    target = start
+    while target <= cap + 1e-9:
+        t = min(target, cap)
+        cand = (clean + delta * (t / base_linf)).clamp(0.0, 1.0)   # scale direction to L-inf=t
+        seen = _png_roundtrip(cand, device)                       # what the validator decodes
+        norm = float((seen - clean).abs().max().item())
+        if floor <= norm <= cap and predict_index(model=model, image_chw=seen) != target_index:
+            return cand          # smallest perturbation that survives PNG AND flips -> best score
+        target += 0.5 * _Q       # half-a-level granularity: tight but cheap search
+
+    return best_fallback         # nothing in-band flipped (minimal flip needs > cap): best effort
 
 
-def _save_triptych(clean, adv, out_path):
-    """Save a side-by-side PNG: [ original | perturbation x-amplified | adversarial ]."""
-    delta = (adv - clean)                                    # the raw perturbation
-    # Stretch the perturbation to [0,1] so we can actually SEE it (it's normally tiny).
-    amp = delta - delta.min()
-    amp = amp / (amp.max() + 1e-12)
-
-    def to_pil(t):
-        arr = (t.clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)  # CHW->HWC, [0,255]
-        return Image.fromarray(arr)
-
-    panels = [to_pil(clean), to_pil(amp), to_pil(adv)]
-    w, h = panels[0].size
-    canvas = Image.new("RGB", (w * 3, h))                    # blank wide strip for 3 panels
-    for i, p in enumerate(panels):
-        canvas.paste(p, (i * w, 0))
-    canvas.save(out_path)
+# ======================================================================================
+# LAB-ONLY helpers (not needed in prod). Shared with flipper-base.py's self-test.
+# score_like_validator mirrors neurons/validator.verify_and_score so a local PASS == a
+# real PASS.
+# ======================================================================================
+def warmup(model: torch.nn.Module, device: torch.device, example_chw: torch.Tensor) -> None:
+    """Call ONCE at startup: a forward+backward to pay CUDA/cuDNN init up front, so the
+    first real challenge isn't slowed by lazy kernel autotuning."""
+    x = example_chw.detach().clone().to(device).unsqueeze(0).requires_grad_(True)
+    logits_for_images(model=model, image_bchw=x).sum().backward()
 
 
-def run_attack(image_path, attack="fmn", hug_floor_on=False, steps=50, eps=None, **knobs):
-    """
-    Run one attack on one image.
+_SAMPLE_URL = "https://github.com/pytorch/hub/raw/master/images/dog.jpg"
+_SAMPLE_PATH = "sample.jpg"
 
-    Returns (adv_path, info_dict). demo.py calls this, then scores adv_path.
-      image_path   : path to the clean input image (any format Pillow reads)
-      attack       : one of {fmn, ddn, fab, pgd, cw}
-      hug_floor_on : rescale perturbation above MIN_LINF_DELTA (see hug_floor above)
-      steps        : iteration count for the iterative attacks (more = stronger/slower)
-      eps          : L-infinity budget; defaults to config.EPSILON
-    """
-    eps = config.EPSILON if eps is None else eps
 
-    # Tell the user which compute device is actually being used. If this says "cpu" on a
-    # machine with a GPU, torch can't see CUDA (e.g. a CPU-only torch wheel) -> expect it slow.
-    print(f"[device] using {config.DEVICE.upper()}"
-          + (f" ({torch.cuda.get_device_name(0)})" if config.DEVICE == "cuda" else ""))
+def load_clean_image(device: torch.device) -> torch.Tensor:
+    """Download a sample image once and decode it the SAME way the validator does."""
+    import base64
+    import os
+    import urllib.request
 
-    model = load_model()
+    if not os.path.exists(_SAMPLE_PATH):
+        print(f"downloading sample image -> {_SAMPLE_PATH}")
+        urllib.request.urlretrieve(_SAMPLE_URL, _SAMPLE_PATH)
+    with open(_SAMPLE_PATH, "rb") as handle:
+        b64 = base64.b64encode(handle.read()).decode("utf-8")
+    return decode_image_b64(b64).to(device)
 
-    # Preprocess EXACTLY like the validator: -> [0,1] tensor at the model's input size.
-    clean = config.pil_to_unit_tensor(Image.open(image_path)).to(config.DEVICE)
-    clean_b = clean.unsqueeze(0)                              # add batch dim -> (1,3,H,W)
 
-    # Untargeted attacks need the CURRENT (clean) label to push away from.
-    orig_label, orig_conf = predict(model, clean)
-    y = torch.tensor([predict_index(model, clean)], device=config.DEVICE)
+def target_index_of(model, clean, device) -> int:
+    """The 'original' class to flee = the model's clean prediction (what the validator uses)."""
+    return predict_index(model=model, image_chw=clean.to(device))
 
-    print(f"[{_stamp()}] starting perturbing.. (attack={attack}, steps={steps}, device={config.DEVICE})")
-    t0 = time.time()                                         # start the wall clock
 
-    if attack in ("fmn", "ddn"):
-        # ---- foolbox minimal-norm attacks ----
-        fmodel = fb.PyTorchModel(model, bounds=(0, 1))       # tell foolbox inputs live in [0,1]
-        if attack == "fmn":
-            atk = fb.attacks.LInfFMNAttack(steps=steps)      # minimize the L-infinity norm
-        else:
-            atk = fb.attacks.DDNAttack(steps=steps)          # minimize the L2 norm
-        # epsilons=None => return the MINIMAL adversarial example (no fixed budget).
-        _, adv_b, _ = atk(fmodel, clean_b, y, epsilons=None)
+def _compute_ssim(x_clean: torch.Tensor, x_adv: torch.Tensor, kernel_size: int = 11) -> float:
+    """Copy of validator._compute_ssim (avg-pool SSIM, c1=0.01^2, c2=0.03^2)."""
+    import torch.nn.functional as F
 
-    elif attack in ("fab", "pgd", "cw"):
-        if attack == "fab":
-            # FAB: geometrically walks to the NEAREST decision boundary (minimal-norm).
-            atk = torchattacks.FAB(model, norm="Linf", eps=eps, steps=steps, n_classes=1000)
-        elif attack == "pgd":
-            # PGD: strongest FIXED-budget L-inf attack; alpha = per-step size.
-            atk = torchattacks.PGD(model, eps=eps, alpha=eps / 4, steps=steps)
-        else:
-            # CW: optimization attack trading off "flip it" vs "stay tiny" (very clean).
-            atk = torchattacks.CW(model, c=1.0, steps=max(steps, 100))
-        adv_b = atk(clean_b, y)                               # torchattacks works in [0,1] directly
-    else:
-        raise ValueError(f"unknown attack {attack!r}; choose fmn|ddn|fab|pgd|cw")
+    padding = kernel_size // 2
+    x, y = x_clean.unsqueeze(0), x_adv.unsqueeze(0)
+    c1, c2 = 0.01 ** 2, 0.03 ** 2
+    mu_x = F.avg_pool2d(x, kernel_size, 1, padding)
+    mu_y = F.avg_pool2d(y, kernel_size, 1, padding)
+    sigma_x = F.avg_pool2d(x * x, kernel_size, 1, padding) - mu_x * mu_x
+    sigma_y = F.avg_pool2d(y * y, kernel_size, 1, padding) - mu_y * mu_y
+    sigma_xy = F.avg_pool2d(x * y, kernel_size, 1, padding) - mu_x * mu_y
+    num = (2.0 * mu_x * mu_y + c1) * (2.0 * sigma_xy + c2)
+    den = (mu_x * mu_x + mu_y * mu_y + c1) * (sigma_x + sigma_y + c2)
+    return float((num / (den + 1e-12)).mean().item())
 
-    # Optional: lift a too-small perturbation above the validator's floor.
-    if hug_floor_on:
-        delta = hug_floor(adv_b - clean_b, config.MIN_LINF_DELTA)
-        adv_b = (clean_b + delta).clamp(0, 1)                # stay inside valid pixel range
 
-    elapsed = time.time() - t0                                # wall-clock attack time
-    print(f"[{_stamp()}] done perturbing.. (took {elapsed:.3f}s)")
-    adv = adv_b.squeeze(0).detach()                          # drop batch dim
+def _compute_psnr_db(x_clean: torch.Tensor, x_adv: torch.Tensor) -> float:
+    """Copy of validator._compute_psnr_db (data_range=1.0; 99.0 if identical)."""
+    import math
 
-    # Re-classify the adversarial image.
-    new_label, new_conf = predict(model, adv)
-    flipped = new_label != orig_label
+    mse = float(torch.mean((x_adv - x_clean) ** 2).item())
+    if mse <= 1e-12:
+        return 99.0
+    return 10.0 * math.log10(1.0 / mse)
 
-    # Save the adversarial image as PNG (the validator scores a saved file, so do we).
-    adv_path = str(image_path).rsplit(".", 1)[0] + f"_adv_{attack}.png"
-    arr = (adv.clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-    Image.fromarray(arr).save(adv_path)
 
-    # Save the explanatory three-panel figure next to it.
-    triptych_path = str(image_path).rsplit(".", 1)[0] + f"_triptych_{attack}.png"
-    _save_triptych(clean, adv, triptych_path)
+def score_like_validator(model, clean, adv, epsilon, min_delta, device) -> dict:
+    """Reproduce neurons/validator.verify_and_score exactly, on the PNG-decoded adv."""
+    seen = _png_roundtrip(adv, device)            # validator scores the decoded PNG, not your tensor
+    cap = min(float(epsilon), float(C.MAX_LINF_DELTA))
+    floor = float(min_delta)
+    original_index = target_index_of(model, clean, device)
 
-    info = {
-        "attack": attack,
-        "orig_label": orig_label, "orig_conf": orig_conf,
-        "new_label": new_label, "new_conf": new_conf,
-        "flipped": flipped,
-        "linf": linf_norm(clean, adv),
-        "rmse": rmse(clean, adv),
-        "time": elapsed,
-        "adv_path": adv_path,
-        "triptych_path": triptych_path,
+    norm = float((seen - clean).abs().max().item())
+    rmse = float(torch.sqrt(torch.mean((seen - clean) ** 2)).item())
+    ssim = _compute_ssim(clean, seen)
+    psnr = _compute_psnr_db(clean, seen)
+    flipped = predict_index(model=model, image_chw=seen) != original_index
+
+    gates = {  # hard gates, in the validator's order; any False -> final 0.0
+        "label_changed": flipped,
+        "norm>=floor": norm >= floor,
+        "norm<=cap": norm <= cap,
+        "ssim>=0.98": ssim >= float(C.MIN_SSIM),
+        "psnr>=38": psnr >= float(C.MIN_PSNR_DB),
     }
+    base = {"gates": gates, "norm": round(norm, 6), "rmse": round(rmse, 6),
+            "ssim": round(ssim, 5), "psnr_db": round(psnr, 3)}
+    if not all(gates.values()):
+        return {**base, "perturbation_score": 0.0, "final": 0.0}
 
-    # Human-readable summary so you FEEL the speed/quality trade-off.
-    print("\n================= ATTACK =================")
-    print(f"attack            : {attack}")
-    print(f"original label    : {orig_label}  (conf {orig_conf:.3f})")
-    print(f"new label         : {new_label}  (conf {new_conf:.3f})")
-    print(f"FLIPPED?          : {'YES' if flipped else 'NO'}")
-    print(f"final L-infinity  : {info['linf']:.5f}   (in [0,1] pixel space)")
-    print(f"final RMSE        : {info['rmse']:.5f}   (in [0,1] pixel space)")
-    print(f"wall-clock time   : {elapsed:.3f} s")
-    print(f"adversarial PNG   : {adv_path}")
-    print(f"triptych PNG      : {triptych_path}")
-    print("==========================================\n")
-
-    return adv_path, info
+    linf_ratio = min(max((norm - floor) / max(1e-12, cap - floor), 0.0), 1.0)
+    rmse_ratio = min(max(rmse / max(1e-12, cap), 0.0), 1.0)
+    linf_score = (1.0 - linf_ratio) ** 2
+    rmse_score = (1.0 - rmse_ratio) ** 2
+    lw, rw = float(C.LINF_COMPONENT_WEIGHT), float(C.RMSE_COMPONENT_WEIGHT)
+    perturbation_score = (lw * linf_score + rw * rmse_score) / (lw + rw)
+    final = float(C.PERTURBATION_WEIGHT) * perturbation_score  # SPEED_WEIGHT=0 -> speed ignored
+    return {**base, "linf_score": round(linf_score, 4), "rmse_score": round(rmse_score, 4),
+            "perturbation_score": round(perturbation_score, 4), "final": round(final, 4)}
 
 
 if __name__ == "__main__":
-    # Allow running the attack stage on its own:  python flipper.py --image x.jpg --attack fmn
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--image", required=True, help="path to the clean input image")
-    ap.add_argument("--attack", default="fmn", choices=["fmn", "ddn", "fab", "pgd", "cw"])
-    ap.add_argument("--hug-floor", action="store_true", help="rescale tiny perturbations above min_delta")
-    ap.add_argument("--steps", type=int, default=50)
-    args = ap.parse_args()
-    run_attack(args.image, attack=args.attack, hug_floor_on=args.hug_floor, steps=args.steps)
+    from perturbnet.model import load_efficientnet_v2_l
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[device] {device}")
+    model = load_efficientnet_v2_l(device)
+    clean = load_clean_image(device)
+    warmup(model, device, clean)                  # pay one-time CUDA/cuDNN init up front
+    target_index = target_index_of(model, clean, device)
+
+    epsilon, min_delta = 0.12, 0.003              # representative challenge values
+    adv = perturb(model, clean, target_index, epsilon, min_delta, device)
+
+    report = score_like_validator(model, clean, adv, epsilon, min_delta, device)
+    print("\n=== FMN (minimal-norm, floor-hugging) ===")
+    for k, v in report.items():
+        print(f"{k:>18}: {v}")

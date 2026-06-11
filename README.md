@@ -1,15 +1,21 @@
 # sota-attack
 
-Flip an **EfficientNetV2-L** ImageNet label with **state-of-the-art adversarial attacks**
-(composed from `foolbox` / `torchattacks` — never reinvented), then score the result
-**exactly like the Bittensor "Perturb" subnet (netuid 26) validator**.
+A local lab for the **Perturb subnet (netuid 26)**: flip an EfficientNetV2-L label with a
+**minimal-norm white-box attack (FMN)** and score it **exactly like the real validator** —
+no bittensor, no networking, no chain.
 
-**What/why.** Perturb is a subnet where miners must change a classifier's prediction with a
-perturbation that is as *small and clean* as possible, as *fast* as possible. The best tools
-for that are **white-box minimal-norm attacks** (FMN, DDN, FAB, C&W): instead of spending a
-fixed noise budget like PGD, they search for the *smallest* change that flips the label —
-which is precisely what the Perturb score rewards. This repo lets you feel those attacks and
-tune them against the *real objective* with one command.
+It mirrors the live subnet repo so the engine code is **copy-paste-ready for prod**: the
+`perturbnet/` package here is a trimmed mirror of the subnet's `perturbnet/`, and both
+attack engines import the same names the real miner does.
+
+## What's inside
+
+| File | Role |
+|------|------|
+| [perturbnet/](perturbnet/) | Mirror of the subnet's package: `model.py`, `image_io.py`, `constants.py` (the **real** thresholds/weights) |
+| [flipper-base.py](flipper-base.py) | **Baseline** engine — the miner's stock PGD, lifted verbatim into `perturb(...)` |
+| [flipper.py](flipper.py) | **FMN** engine — minimal-norm, floor-hugging, PNG-aware. Same `perturb(...)` signature |
+| [demo.py](demo.py) | Runs both engines on a sample image, prints validator-exact scores side by side |
 
 ## Install & run
 
@@ -18,66 +24,73 @@ pip install -r requirements.txt
 python demo.py
 ```
 
-`python demo.py` downloads one sample image, runs the default attack (`fmn`), saves the
-adversarial PNG + a three-panel figure, and prints a full **PASS/FAIL + score** report.
-(First run also downloads the EfficientNetV2-L weights, a few hundred MB.)
+`python demo.py` downloads one sample image, runs both engines, and prints a full
+gate-by-gate + score report for each. Flags: `--engine {both,fmn,base}`, `--steps N`.
 
-### Attack options
-
-```bash
-python demo.py --attack fmn   # foolbox  : minimal L-infinity (default)
-python demo.py --attack ddn   # foolbox  : minimal L2
-python demo.py --attack fab   # torchattacks: nearest decision boundary (minimal-norm)
-python demo.py --attack pgd   # torchattacks: fixed-budget L-inf baseline (loud but reliable)
-python demo.py --attack cw    # torchattacks: Carlini-Wagner optimization (very clean)
-```
-
-Extra knobs: `--steps N` (more = stronger/slower), `--hug-floor` (see below).
-
-You can also run the stages alone:
+You can also run either engine's self-test directly:
 
 ```bash
-python flipper.py --image sample.jpg --attack cw
-python verifier.py --clean sample.jpg --adv sample_adv_cw.png --time 1.5
+python flipper.py          # FMN only
+python flipper-base.py     # baseline only
 ```
 
-## The tuning loop
+## How scoring works (the real objective)
 
-1. **Run an attack** — `python demo.py --attack <name> --steps <n>`.
-2. **Read the report** — look at `perturbation_score` (how small/clean) and `speed_score`
-   (how fast), plus which hard gates passed.
-3. **Adjust:**
-   - Score is `0.0` and only the **`linf_above_floor`** gate failed? The attack was *too
-     subtle*. Re-run with `--hug-floor` (rescales the perturbation just above `MIN_LINF_DELTA`).
-   - `perturbation_score` low? Switch to a cleaner attack (`cw`, `fmn`, `fab`) or fewer steps.
-   - `speed_score` low? Use fewer `--steps` or a faster attack (`fmn`/`pgd`) — feel the trade-off.
-4. Repeat and push the **FINAL** score up.
+Measured in the **decoded native-resolution `[0,1]` image** (what `decode_image_b64`
+returns — NOT the 480px model space):
 
-## Make it match the real subnet
+```
+norm = max|adv-clean| ,  rmse = sqrt(mean((adv-clean)^2))
+```
 
-The numbers in [config.py](config.py) under the LOUD warning block are **placeholders**.
-Before you trust a score, replace them with the subnet's real values:
+Hard gates (any fail → **0.0**): label changed · `0.003 ≤ norm ≤ 0.03` · `ssim ≥ 0.98` ·
+`psnr ≥ 38`. If they pass:
 
-1. **Model + preprocessing** — copy the exact model construction and the exact
-   resize/crop/normalize from `perturbnet/model.py` into [config.py](config.py)
-   (`WEIGHTS`, `pil_to_unit_tensor`, `normalize`) and mirror its label logic in
-   [model.py](model.py)'s `predict()`.
-2. **Scoring constants** — paste the real values from `perturbnet/constants.py`. Find them with:
+```
+perturbation_score = 0.7·(1-linf_ratio)² + 0.3·(1-rmse_ratio)²
+final = 1·perturbation_score + 0·speed_score      # SPEED_WEIGHT = 0
+```
 
-   ```bash
-   grep -rn "EPSILON\|MIN_LINF_DELTA\|MAX_LINF_DELTA\|MIN_SSIM\|MIN_PSNR\|TIMEOUT\|PERTURBATION_WEIGHT\|SPEED_WEIGHT\|COMPONENT_WEIGHT" perturbnet/
-   ```
+**Key consequences** (read straight from the subnet's `validator.py` / `constants.py`):
 
-3. **Measurement space** — confirm whether the validator measures L-infinity / RMSE / SSIM /
-   PSNR in `[0,1]` pixel space (what this repo assumes) or `0-255` or the normalized space,
-   and adjust [verifier.py](verifier.py) / [config.py](config.py) accordingly.
+- **Speed doesn't score.** Only the 15s hard timeout and `processed_count` eligibility
+  care about speed. So optimize purely for a small, clean perturbation.
+- **`min(epsilon, 0.03)` is always 0.03** (epsilon is sampled in `[0.06, 0.20]`).
+- **The optimum is to hug the floor.** `linf_score` is maximized as `norm → 0.003`.
+- **PNG quantization sets the real floor.** The validator scores a re-decoded PNG, so
+  pixels snap to multiples of `1/255 ≈ 0.00392`. The smallest *survivable* `norm` is
+  `1/255`, which is just above 0.003 → `linf_score ≈ 0.93`.
 
-## Files
+## Why FMN beats the baseline
 
-| File | Role |
-|------|------|
-| [config.py](config.py) | Single source of truth: model, preprocessing, all Perturb thresholds + weights |
-| [model.py](model.py) | Loads the frozen EfficientNetV2-L, `predict()` + label mapping |
-| [flipper.py](flipper.py) | Composes the SOTA attacks via foolbox / torchattacks |
-| [verifier.py](verifier.py) | Local replica of the validator's gates + score |
-| [demo.py](demo.py) | End-to-end: download → attack → save → score → report |
+The baseline PGD clamps to `±epsilon` (up to 0.2) and steps by `epsilon/4` — so it
+routinely **overshoots the 0.03 cap → scores 0.0**. The FMN engine instead:
+
+1. runs **FMN** (via foolbox) to find the *minimal-L∞* flip direction, then
+2. does a **PNG-aware line search**: scales that direction to the smallest `norm` that
+   *still flips after the 8-bit PNG round-trip* and passes every gate.
+
+`score_like_validator()` in [flipper.py](flipper.py) reproduces the validator's own
+avg-pool SSIM, PSNR, gate order, and formula — so a local PASS predicts a real PASS.
+
+## Deploying to prod (the real miner)
+
+The engine is a literal drop-in. In the real `neurons/miner.py`, replace the inline PGD
+loop in `forward(...)` with:
+
+```python
+from flipper import perturb
+adv = perturb(self.model, clean, target_index, epsilon, min_delta, self.device)
+```
+
+Then add `foolbox` to the miner's `requirements.txt`. Optionally call `warmup(...)` once
+in the miner's `__init__` so the first challenge isn't slowed by cold CUDA init. Because
+`perturb()` only imports from `perturbnet.*` (which prod already has), it copies over with
+no edits.
+
+## Tuning loop
+
+1. `python demo.py --steps N` — read each engine's `perturbation_score` and which gates passed.
+2. If FMN's `final` is 0.0, check the failed gate: usually it means the minimal flip needs
+   `norm > 0.03` (image is hard to flip subtly) — raise `--steps`, or accept it's a hard image.
+3. The achievable ceiling per image ≈ `linf_score 0.93` (norm at `1/255`) with `rmse` near 0.

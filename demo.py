@@ -1,65 +1,63 @@
 """
-demo.py — the default entry point and the whole tuning loop in one file.
+demo.py — run BOTH engines on one sample image and print their validator-exact scores
+side by side. This is the tuning loop: see the baseline (often 0.0, overshoots the cap)
+vs the FMN engine (hugs the 0.003 floor).
 
-    python demo.py                 # default attack (fmn) on a downloaded sample image
-    python demo.py --attack pgd    # try a different attack
-    python demo.py --attack fmn --hug-floor   # lift a too-small perturbation above the floor
+    python demo.py                 # both engines
+    python demo.py --engine fmn    # just the FMN engine
+    python demo.py --engine base   # just the baseline
+    python demo.py --steps 40      # FMN iteration count
 
-It: (1) downloads ONE sample image if missing, (2) runs the chosen attack via
-flipper.run_attack(), (3) scores the result with verifier.score() using the MEASURED
-attack time, and (4) prints the combined report. Watch perturbation_score / speed_score
-and adjust the attack or its knobs to push the FINAL score up.
+The scoring (score_like_validator) mirrors neurons/validator.verify_and_score, so a PASS
+here predicts a PASS on the real subnet.
 """
 
 import argparse
+import importlib.util
 import os
-import urllib.request
 
-from flipper import run_attack
-from verifier import score, print_report
+import torch
 
-# A small, reliable ImageNet-style sample (a dog) from the official PyTorch hub assets.
-SAMPLE_URL = "https://github.com/pytorch/hub/raw/master/images/dog.jpg"
-SAMPLE_PATH = "sample.jpg"
+from perturbnet.model import load_efficientnet_v2_l
+from flipper import load_clean_image, score_like_validator, target_index_of, warmup, perturb as perturb_fmn
+
+# flipper-base.py has a hyphen (not import-friendly), so load it by file path.
+_base_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flipper-base.py")
+_spec = importlib.util.spec_from_file_location("flipper_base", _base_path)
+_base = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_base)
+perturb_base = _base.perturb
 
 
-def ensure_sample():
-    """Download the sample image once; reuse it on later runs."""
-    if not os.path.exists(SAMPLE_PATH):
-        print(f"downloading sample image -> {SAMPLE_PATH}")
-        urllib.request.urlretrieve(SAMPLE_URL, SAMPLE_PATH)
-    else:
-        print(f"using cached sample image: {SAMPLE_PATH}")
-    return SAMPLE_PATH
+def _run(name, fn, model, clean, target_index, epsilon, min_delta, device, **kw):
+    adv = fn(model, clean, target_index, epsilon, min_delta, device, **kw)
+    report = score_like_validator(model, clean, adv, epsilon, min_delta, device)
+    print(f"\n=== {name} ===")
+    for k, v in report.items():
+        print(f"{k:>18}: {v}")
+    return report
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Flip an EfficientNetV2-L label and score it like Perturb.")
-    ap.add_argument("--attack", default="fmn", choices=["fmn", "ddn", "fab", "pgd", "cw"],
-                    help="which SOTA attack to compose (default: fmn)")
-    ap.add_argument("--hug-floor", action="store_true",
-                    help="rescale tiny perturbations just above min_linf_delta")
-    ap.add_argument("--steps", type=int, default=50, help="iteration count for iterative attacks")
+    ap = argparse.ArgumentParser(description="Compare baseline PGD vs FMN on the Perturb objective.")
+    ap.add_argument("--engine", choices=["both", "fmn", "base"], default="both")
+    ap.add_argument("--steps", type=int, default=30, help="FMN iteration count")
     args = ap.parse_args()
 
-    image = ensure_sample()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[device] {device}")
+    model = load_efficientnet_v2_l(device)
+    clean = load_clean_image(device)
+    warmup(model, device, clean)                      # pay one-time CUDA/cuDNN init up front
 
-    # 1) ATTACK — flip the label and get back the saved adversarial PNG + timing/metrics.
-    adv_path, info = run_attack(image, attack=args.attack,
-                                hug_floor_on=args.hug_floor, steps=args.steps)
+    target_index = target_index_of(model, clean, device)  # model's clean prediction = class to flee
+    epsilon, min_delta = 0.12, 0.003                  # representative challenge values
 
-    # 2) SCORE — feed clean + adversarial + the measured attack time into the validator replica.
-    report = score(image, adv_path, response_time=info["time"])
-    print_report(report)
-
-    # 3) One-line takeaway to guide the next tuning step.
-    if report["final"] > 0:
-        print(f">>> SUCCESS: final Perturb score = {report['final']:.4f}. "
-              f"Lower distortion or faster attack -> higher score.")
-    else:
-        failed = [k for k, v in report["gates"].items() if not v]
-        print(f">>> SCORE 0.0 — failed gate(s): {failed}. "
-              f"If it's only 'linf_above_floor', re-run with --hug-floor.")
+    if args.engine in ("both", "base"):
+        _run("BASELINE (PGD)", perturb_base, model, clean, target_index, epsilon, min_delta, device)
+    if args.engine in ("both", "fmn"):
+        _run("FMN (minimal-norm, floor-hugging)", perturb_fmn, model, clean,
+             target_index, epsilon, min_delta, device, steps=args.steps)
 
 
 if __name__ == "__main__":
