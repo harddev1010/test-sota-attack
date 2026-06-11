@@ -17,6 +17,7 @@ exactly what the Perturb score rewards. PGD is included as a loud, reliable base
 
 import argparse
 import time
+from datetime import datetime  # for human-readable wall-clock timestamps in the logs
 
 import torch
 import numpy as np
@@ -26,6 +27,13 @@ import foolbox as fb
 
 import config
 from model import load_model, predict, predict_index
+
+
+def _stamp():
+    """Current wall-clock time as MM:SS.mmm (minute:second:millisecond) for logs."""
+    now = datetime.now()
+    # %M=minute, %S=second; the last 3 digits of %f (microseconds) give milliseconds.
+    return now.strftime("%M:%S") + f".{now.microsecond // 1000:03d}"
 
 
 # ----------------------------------------------------------------------------------
@@ -88,6 +96,12 @@ def run_attack(image_path, attack="fmn", hug_floor_on=False, steps=50, eps=None,
       eps          : L-infinity budget; defaults to config.EPSILON
     """
     eps = config.EPSILON if eps is None else eps
+
+    # Tell the user which compute device is actually being used. If this says "cpu" on a
+    # machine with a GPU, torch can't see CUDA (e.g. a CPU-only torch wheel) -> expect it slow.
+    print(f"[device] using {config.DEVICE.upper()}"
+          + (f" ({torch.cuda.get_device_name(0)})" if config.DEVICE == "cuda" else ""))
+
     model = load_model()
 
     # Preprocess EXACTLY like the validator: -> [0,1] tensor at the model's input size.
@@ -98,6 +112,7 @@ def run_attack(image_path, attack="fmn", hug_floor_on=False, steps=50, eps=None,
     orig_label, orig_conf = predict(model, clean)
     y = torch.tensor([predict_index(model, clean)], device=config.DEVICE)
 
+    print(f"[{_stamp()}] starting perturbing.. (attack={attack}, steps={steps}, device={config.DEVICE})")
     t0 = time.time()                                         # start the wall clock
 
     if attack in ("fmn", "ddn"):
@@ -130,6 +145,7 @@ def run_attack(image_path, attack="fmn", hug_floor_on=False, steps=50, eps=None,
         adv_b = (clean_b + delta).clamp(0, 1)                # stay inside valid pixel range
 
     elapsed = time.time() - t0                                # wall-clock attack time
+    print(f"[{_stamp()}] done perturbing.. (took {elapsed:.3f}s)")
     adv = adv_b.squeeze(0).detach()                          # drop batch dim
 
     # Re-classify the adversarial image.
