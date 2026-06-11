@@ -15,9 +15,11 @@ here predicts a PASS on the real subnet.
 import argparse
 import importlib.util
 import os
+import time
 
 import torch
 
+from perturbnet import constants as C
 from perturbnet.model import load_efficientnet_v2_l
 from flipper import load_clean_image, score_like_validator, target_index_of, warmup, perturb as perturb_fmn
 
@@ -30,11 +32,18 @@ perturb_base = _base.perturb
 
 
 def _run(name, fn, model, clean, target_index, epsilon, min_delta, device, **kw):
+    t0 = time.time()
     adv = fn(model, clean, target_index, epsilon, min_delta, device, **kw)
+    attack_time = time.time() - t0                      # wall-clock the miner would spend
     report = score_like_validator(model, clean, adv, epsilon, min_delta, device)
     print(f"\n=== {name} ===")
     for k, v in report.items():
         print(f"{k:>18}: {v}")
+    # Timeout is a SEPARATE hard cutoff (not part of the score): a late/missing reply -> 0.0.
+    safe = attack_time < (C.TIMEOUT_SECONDS - 1.0)
+    print(f"{'attack_time':>18}: {attack_time:.3f}s")
+    print(f"{'within_timeout':>18}: {'PASS' if safe else 'FAIL'}  "
+          f"(<{C.TIMEOUT_SECONDS - 1.0:.0f}s of the {C.TIMEOUT_SECONDS:.0f}s cutoff)")
     return report
 
 

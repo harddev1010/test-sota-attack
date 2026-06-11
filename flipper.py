@@ -36,6 +36,8 @@ so the smallest survivable norm is 1/255 — conveniently just above the 0.003 f
 hug exactly that.
 """
 
+import time
+
 import torch
 
 import foolbox as fb  # SOTA attack library — we COMPOSE FMN from it, never reimplement it
@@ -81,19 +83,44 @@ def perturb(
     min_delta: float,
     device: torch.device,
     steps: int = 30,
+    timeout_seconds: float = None,
+    time_margin: float = 2.0,
 ) -> torch.Tensor:
-    """Minimal-norm flip tuned to the validator's post-PNG scoring.
+    """Minimal-norm flip tuned to the validator's post-PNG scoring, with a hard time budget.
 
-    Same signature/return as flipper-base.perturb. `steps` = FMN iterations (20-40 plenty)."""
+    Same first-6 args / return as flipper-base.perturb (drop-in). Extra optional args:
+      timeout_seconds: the challenge timeout (defaults to C.TIMEOUT_SECONDS). The miner can
+                       pass synapse.timeout_seconds here.
+      time_margin:     finish this many seconds BEFORE the timeout so the encoded response is
+                       safely back in time (the validator zeroes any late/missing reply).
+    `steps` is the DESIRED FMN iteration count; it is automatically reduced if the hardware
+    can't run that many within the budget."""
+    t_start = time.time()
+    timeout_seconds = float(C.TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds)
+    deadline = t_start + max(1.0, timeout_seconds - time_margin)  # the moment we MUST be done by
+
     epsilon = float(epsilon)
     min_delta = float(min_delta)
     cap = min(epsilon, float(C.MAX_LINF_DELTA))   # score-eligible ceiling (0.03 in prod)
     floor = min_delta                             # score-eligible floor (0.003 in prod)
     clean = clean.to(device)
 
-    # ---- 1) FMN: minimal-L-inf adversarial DIRECTION ---------------------------------
     fmodel = fb.PyTorchModel(_PreprocessedModel(model).to(device).eval(), bounds=(0.0, 1.0))
-    attack = fb.attacks.LInfFMNAttack(steps=steps)              # minimises the L-inf norm of the flip
+
+    # ---- size FMN steps to the time budget -------------------------------------------
+    # One forward+backward ~= one FMN step. Probe that cost once on THIS image (resolution
+    # varies per challenge), then fit as many steps as the budget allows, leaving room for
+    # the cheap line search. This guarantees we don't overrun the deadline on slow CPUs.
+    probe = time.time()
+    xp = clean.unsqueeze(0).detach().requires_grad_(True)
+    logits_for_images(model=model, image_bchw=xp).sum().backward()
+    step_cost = max(time.time() - probe, 1e-3) * 1.3              # +30% safety margin
+    line_search_reserve = 16 * 0.6 * step_cost                    # ~16 forward-only candidates
+    fmn_budget = (deadline - time.time()) - line_search_reserve
+    eff_steps = int(max(1, min(steps, fmn_budget // step_cost)))  # never fewer than 1 step
+
+    # ---- 1) FMN: minimal-L-inf adversarial DIRECTION ---------------------------------
+    attack = fb.attacks.LInfFMNAttack(steps=eff_steps)          # minimises the L-inf norm of the flip
     labels = torch.tensor([int(target_index)], device=device)  # the class to move AWAY from
     _, advs, _ = attack(fmodel, clean.unsqueeze(0), labels, epsilons=None)  # None -> minimal
     delta = advs.squeeze(0) - clean                            # perturbation direction FMN found
@@ -105,12 +132,12 @@ def perturb(
     # ---- 2) PNG-aware line search: smallest survivable flip --------------------------
     # Scale `delta` to target L-inf values from the floor up to the cap. For each, simulate
     # the exact PNG round-trip and accept the FIRST (=smallest, =highest score) one that
-    # still flips and lands inside [floor, cap].
+    # still flips and lands inside [floor, cap]. Stop early if we reach the deadline.
     start = max(floor, _Q)                                      # below 1/255 it rounds away to nothing
     best_fallback = (clean + delta * (cap / base_linf)).clamp(0.0, 1.0)  # strongest legal try
 
     target = start
-    while target <= cap + 1e-9:
+    while target <= cap + 1e-9 and time.time() < deadline:     # <-- deadline guard
         t = min(target, cap)
         cand = (clean + delta * (t / base_linf)).clamp(0.0, 1.0)   # scale direction to L-inf=t
         seen = _png_roundtrip(cand, device)                       # what the validator decodes
@@ -119,7 +146,7 @@ def perturb(
             return cand          # smallest perturbation that survives PNG AND flips -> best score
         target += 0.5 * _Q       # half-a-level granularity: tight but cheap search
 
-    return best_fallback         # nothing in-band flipped (minimal flip needs > cap): best effort
+    return best_fallback         # deadline hit or nothing in-band flipped: best effort
 
 
 # ======================================================================================
@@ -157,6 +184,23 @@ def target_index_of(model, clean, device) -> int:
     return predict_index(model=model, image_chw=clean.to(device))
 
 
+def predict_label_conf(model, image_chw) -> tuple:
+    """Return (label_string, confidence) from EfficientNetV2-L for a CHW [0,1] image.
+
+    confidence = softmax probability of the top-1 class. The validator only uses the label
+    (argmax) for gating; confidence is reported here purely so you can SEE how decisively the
+    label flipped."""
+    from perturbnet.model import LABELS
+
+    with torch.no_grad():
+        logits = logits_for_images(model=model, image_bchw=image_chw.unsqueeze(0))
+        probs = logits.softmax(dim=1)
+        conf, idx = probs.max(dim=1)
+    i = int(idx.item())
+    label = LABELS[i] if 0 <= i < len(LABELS) else str(i)
+    return label, float(conf.item())
+
+
 def _compute_ssim(x_clean: torch.Tensor, x_adv: torch.Tensor, kernel_size: int = 11) -> float:
     """Copy of validator._compute_ssim (avg-pool SSIM, c1=0.01^2, c2=0.03^2)."""
     import torch.nn.functional as F
@@ -191,6 +235,10 @@ def score_like_validator(model, clean, adv, epsilon, min_delta, device) -> dict:
     floor = float(min_delta)
     original_index = target_index_of(model, clean, device)
 
+    # EfficientNetV2-L label + confidence, before and after the attack (informational).
+    clean_label, clean_conf = predict_label_conf(model, clean)
+    adv_label, adv_conf = predict_label_conf(model, seen)
+
     norm = float((seen - clean).abs().max().item())
     rmse = float(torch.sqrt(torch.mean((seen - clean) ** 2)).item())
     ssim = _compute_ssim(clean, seen)
@@ -204,7 +252,9 @@ def score_like_validator(model, clean, adv, epsilon, min_delta, device) -> dict:
         "ssim>=0.98": ssim >= float(C.MIN_SSIM),
         "psnr>=38": psnr >= float(C.MIN_PSNR_DB),
     }
-    base = {"gates": gates, "norm": round(norm, 6), "rmse": round(rmse, 6),
+    base = {"clean_label": f"{clean_label} ({clean_conf:.3f})",
+            "adv_label": f"{adv_label} ({adv_conf:.3f})",
+            "gates": gates, "norm": round(norm, 6), "rmse": round(rmse, 6),
             "ssim": round(ssim, 5), "psnr_db": round(psnr, 3)}
     if not all(gates.values()):
         return {**base, "perturbation_score": 0.0, "final": 0.0}
@@ -231,9 +281,14 @@ if __name__ == "__main__":
     target_index = target_index_of(model, clean, device)
 
     epsilon, min_delta = 0.12, 0.003              # representative challenge values
+    t0 = time.time()
     adv = perturb(model, clean, target_index, epsilon, min_delta, device)
+    attack_time = time.time() - t0
 
     report = score_like_validator(model, clean, adv, epsilon, min_delta, device)
     print("\n=== FMN (minimal-norm, floor-hugging) ===")
     for k, v in report.items():
         print(f"{k:>18}: {v}")
+    safe = attack_time < (C.TIMEOUT_SECONDS - 1.0)
+    print(f"{'attack_time':>18}: {attack_time:.3f}s")
+    print(f"{'within_timeout':>18}: {'PASS' if safe else 'FAIL'} (cutoff {C.TIMEOUT_SECONDS:.0f}s)")
