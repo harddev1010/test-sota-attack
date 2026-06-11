@@ -1,0 +1,9 @@
+# Minimal dependency set. Install with:  pip install -r requirements.txt
+# (CPU works; a CUDA GPU makes the attacks much faster but is not required.)
+torch              # the deep-learning engine (tensors + autograd that attacks rely on)
+torchvision        # gives us EfficientNetV2-L + its official ImageNet weights/preprocessing
+foolbox            # SOTA minimal-norm attacks (FMN, DDN) — composed, not reinvented
+torchattacks       # SOTA attacks (FAB, PGD, CW) with a one-line API
+pillow             # image loading / saving (PNG round-trip the validator also does)
+numpy              # array math for the scoring metrics
+scikit-image       # battle-tested SSIM and PSNR implementations for the score gates

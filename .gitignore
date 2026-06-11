@@ -1,0 +1,29 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Downloaded sample image (demo.py re-downloads it on demand) ---
+sample.jpg
+
+# --- Generated attack outputs (created by flipper.py / demo.py) ---
+*_adv_*.png
+*_triptych_*.png
+
+# --- Model weight caches (downloaded on first run, hundreds of MB) ---
+*.pth
+.cache/
+
+# --- Editor / OS cruft ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
