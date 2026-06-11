@@ -39,6 +39,7 @@ hug exactly that.
 import time
 
 import torch
+import torch.nn.functional as F
 
 import foolbox as fb  # SOTA attack library — we COMPOSE FMN from it, never reimplement it
 
@@ -75,6 +76,51 @@ def _png_roundtrip(image_chw: torch.Tensor, device: torch.device) -> torch.Tenso
     return decode_image_b64(encode_image_b64(image_chw)).to(device)
 
 
+def _png_eval(model, clean, cand, target_index, device):
+    """PNG round-trip a candidate and report (norm, flipped) the way the validator would."""
+    seen = _png_roundtrip(cand, device)
+    norm = float((seen - clean).abs().max().item())
+    flipped = predict_index(model=model, image_chw=seen) != target_index
+    return norm, flipped
+
+
+def _scale_to(clean, direction, base_linf, t):
+    """Scale a perturbation DIRECTION so its L-infinity == t, add to clean, clamp to [0,1]."""
+    return (clean + direction * (t / base_linf)).clamp(0.0, 1.0)
+
+
+def _fmn_direction(model, clean, target_index, device, steps):
+    """FMN (minimal-L-inf) perturbation DIRECTION. Returns the RAW adversarial minus clean.
+
+    NB: we take attack()'s FIRST return (raw_advs). For foolbox minimisation attacks the
+    SECOND return (clipped_advs) with epsilons=None comes back as the CLEAN image — taking
+    it was the bug that made FMN look like it did nothing."""
+    fmodel = fb.PyTorchModel(_PreprocessedModel(model).to(device).eval(), bounds=(0.0, 1.0))
+    attack = fb.attacks.LInfFMNAttack(steps=steps)
+    labels = torch.tensor([int(target_index)], device=device)   # the class to move AWAY from
+    raw_advs, _, _ = attack(fmodel, clean.unsqueeze(0), labels, epsilons=None)  # RAW = minimal adv
+    return raw_advs.squeeze(0) - clean
+
+
+def _pgd_direction(model, clean, target_index, cap, device, deadline, steps=12):
+    """Reliable fallback: untargeted PGD clamped to the SCORE cap (0.03), not epsilon.
+
+    This is the baseline's loop but projected into ±cap so it stays score-eligible. Used only
+    when FMN fails to produce a flipping direction, so the label still changes."""
+    adv = clean.clone().detach()
+    step_size = max(cap / 4.0, 1.0 / 255.0)
+    for _ in range(steps):
+        if time.time() >= deadline:
+            break
+        adv.requires_grad_(True)
+        logits = logits_for_images(model=model, image_bchw=adv.unsqueeze(0))
+        loss = F.cross_entropy(logits, torch.tensor([target_index], device=device))
+        grad = torch.autograd.grad(loss, adv)[0]
+        adv = adv.detach() + step_size * grad.sign()
+        adv = torch.max(torch.min(adv, clean + cap), clean - cap).clamp(0.0, 1.0)  # ±cap, not ±eps
+    return adv - clean
+
+
 def perturb(
     model: torch.nn.Module,
     clean: torch.Tensor,
@@ -105,48 +151,53 @@ def perturb(
     floor = min_delta                             # score-eligible floor (0.003 in prod)
     clean = clean.to(device)
 
-    fmodel = fb.PyTorchModel(_PreprocessedModel(model).to(device).eval(), bounds=(0.0, 1.0))
-
-    # ---- size FMN steps to the time budget -------------------------------------------
-    # One forward+backward ~= one FMN step. Probe that cost once on THIS image (resolution
-    # varies per challenge), then fit as many steps as the budget allows, leaving room for
-    # the cheap line search. This guarantees we don't overrun the deadline on slow CPUs.
+    # ---- size the FMN budget -----------------------------------------------------------
+    # One forward+backward ~= one FMN step. Probe that cost on THIS image (resolution varies
+    # per challenge) and keep ~60% of the remaining time for FMN, leaving the rest for the
+    # cheap line search. FMN with <5 steps is useless, so if we can't afford that we skip
+    # straight to the reliable PGD direction below.
     probe = time.time()
     xp = clean.unsqueeze(0).detach().requires_grad_(True)
     logits_for_images(model=model, image_bchw=xp).sum().backward()
-    step_cost = max(time.time() - probe, 1e-3) * 1.3              # +30% safety margin
-    line_search_reserve = 16 * 0.6 * step_cost                    # ~16 forward-only candidates
-    fmn_budget = (deadline - time.time()) - line_search_reserve
-    eff_steps = int(max(1, min(steps, fmn_budget // step_cost)))  # never fewer than 1 step
+    step_cost = max(time.time() - probe, 1e-3)
+    affordable = int(((deadline - time.time()) * 0.6) // step_cost)
+    fmn_steps = min(int(steps), max(0, affordable))
 
-    # ---- 1) FMN: minimal-L-inf adversarial DIRECTION ---------------------------------
-    attack = fb.attacks.LInfFMNAttack(steps=eff_steps)          # minimises the L-inf norm of the flip
-    labels = torch.tensor([int(target_index)], device=device)  # the class to move AWAY from
-    _, advs, _ = attack(fmodel, clean.unsqueeze(0), labels, epsilons=None)  # None -> minimal
-    delta = advs.squeeze(0) - clean                            # perturbation direction FMN found
-    base_linf = float(delta.abs().max().item())
+    # ---- 1) pick a flipping DIRECTION — LABEL CHANGE IS THE HARD PRIORITY --------------
+    # Prefer FMN's minimal-norm direction, but ONLY if it actually flips when scaled to the
+    # cap. Otherwise fall back to PGD, which reliably flips. This guarantees we never return
+    # an unperturbed image when a flip within the cap is reachable.
+    direction = None
+    if fmn_steps >= 5:
+        d = _fmn_direction(model, clean, target_index, device, fmn_steps)
+        bl = float(d.abs().max().item())
+        if bl > 1e-12 and _png_eval(model, clean, _scale_to(clean, d, bl, cap), target_index, device)[1]:
+            direction = d                                       # FMN flips at the cap -> use it (best minimality)
+    if direction is None:
+        direction = _pgd_direction(model, clean, target_index, cap, device, deadline)
 
-    if base_linf < 1e-12:                                       # FMN produced nothing usable
-        return clean.clone()                                   # validator will score 0.0
+    base_linf = float(direction.abs().max().item())
+    if base_linf < 1e-12:
+        return clean.clone()                                   # couldn't move at all (shouldn't happen)
 
-    # ---- 2) PNG-aware line search: smallest survivable flip --------------------------
-    # Scale `delta` to target L-inf values from the floor up to the cap. For each, simulate
-    # the exact PNG round-trip and accept the FIRST (=smallest, =highest score) one that
-    # still flips and lands inside [floor, cap]. Stop early if we reach the deadline.
-    start = max(floor, _Q)                                      # below 1/255 it rounds away to nothing
-    best_fallback = (clean + delta * (cap / base_linf)).clamp(0.0, 1.0)  # strongest legal try
+    # Strongest legal perturbation = direction scaled to the cap. Keep it as a guaranteed flip.
+    cap_scaled = _scale_to(clean, direction, base_linf, cap)
+    cap_norm, cap_flip = _png_eval(model, clean, cap_scaled, target_index, device)
+    if not (cap_flip and floor <= cap_norm <= cap):
+        return cap_scaled        # flip not achievable within the cap (hard image): best effort
 
-    target = start
-    while target <= cap + 1e-9 and time.time() < deadline:     # <-- deadline guard
-        t = min(target, cap)
-        cand = (clean + delta * (t / base_linf)).clamp(0.0, 1.0)   # scale direction to L-inf=t
-        seen = _png_roundtrip(cand, device)                       # what the validator decodes
-        norm = float((seen - clean).abs().max().item())
-        if floor <= norm <= cap and predict_index(model=model, image_chw=seen) != target_index:
+    # ---- 2) line search DOWN: smallest norm that STILL flips after PNG -----------------
+    # We already hold a flipping result (cap_scaled), so the label stays changed no matter
+    # what. Now climb from the floor and return the FIRST (=smallest, =highest score) flip.
+    best = cap_scaled
+    target = max(floor, _Q)                                    # below 1/255 the perturbation rounds away
+    while target <= cap + 1e-9 and time.time() < deadline:
+        cand = _scale_to(clean, direction, base_linf, min(target, cap))
+        norm, flip = _png_eval(model, clean, cand, target_index, device)
+        if flip and floor <= norm <= cap:
             return cand          # smallest perturbation that survives PNG AND flips -> best score
         target += 0.5 * _Q       # half-a-level granularity: tight but cheap search
-
-    return best_fallback         # deadline hit or nothing in-band flipped: best effort
+    return best                  # deadline hit before a smaller flip: return the guaranteed one
 
 
 # ======================================================================================
